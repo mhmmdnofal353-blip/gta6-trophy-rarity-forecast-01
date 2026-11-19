@@ -1,44 +1,45 @@
-"""gta6-trophy-rarity-forecast-01 entry: a pooled curve-extension quantile forecaster.
+"""Pooled curve-extension forecaster for GTA VI trophy earn rates.
 
-The idea, in one paragraph: a trophy's earn rate on Exophase is a ratio -- the players who
-have earned it over the players tracked -- and over a game's first week both sides of that
-ratio move in log time. Each trophy's rate, read in logit against u = ln(1 + hours since
-release), climbs its own curve: fast for the trophies the first hours hand out, slower for
-the ones gated behind forty hours of story, flattening as it nears the share of players who
-will ever earn it this week. No single trophy's two and a half days of reads pin its curve
-down -- the reads arrive in steps (the page only changes when Exophase refreshes it), the
-printed rates are rounded to two decimals, and the rarest trophies are a handful of players
--- so this program fits every trophy's curve and then shrinks each slope toward the pooled
-slope of the trophies sitting at the same rate, the analog step: trophies at the same level
-grow alike. The median is the shrunk curve read at the target, held above the floor the
-earner counts impose (earners never un-earn, so a rate can only fall as fast as the tracked
-count grows), and the spread is the house random walk's, discounted for the part the trend
-explains, plus the fit's own residual, the slope dispersion inside the level bin and the
-counting noise of the anchor itself.
+Entry for make.fun's gta6-trophy-rarity-forecast-01. Pure Python 3 standard
+library, offline, deterministic: the same input bytes always produce the same
+output bytes.
 
-Why this scores: the contest's loss is the pinball loss on the logit scale, whose optimal
-forecast is the conditional quantiles of logit(rate) -- and a trophies-at-the-same-level
-pooled curve is a far lower-variance estimate of each trophy's conditional median than
-either house baseline's answer (the last rate held flat, or one trophy's own noisy line
-extended alone). The spread is built from the same pooled quantities, so it widens exactly
-where the data is thin: the rare trophies, the short histories, the trophies whose
-neighbours disagree about the slope.
+For every case file (<id>.in) in the input directory the program writes
+<id>.out to the output directory, holding five quantiles (5/25/50/75/95%) of
+each trophy's Exophase earn rate (percent) at the case's target time.
 
-Two guards cover what the fits cannot see. If the page has not changed for hours when the
-checkpoint falls early in the game's life, a refresh is pending whose first effect is
-dilution (the tracked count jumps, the earners do not), so the median steps down and the
-down side widens. And whatever happens, a trophy whose last rate is the page's ceiling or
-floor is forecast at that bound, not extrapolated through it.
+Method, in outline:
 
-The program is deterministic, standard library only, and never touches the network: for
-each case it reads only that case's `trophies` and `history`. If a case's history is too
-thin to fit (a single unchanging page), it falls back to persistence with an honestly wide
-spread, so a forecast file is always written and always valid.
+  * The recorded page history is first compressed into distinct page states:
+    consecutive reads that show the same players-tracked count and the same
+    rates are one state, because Exophase refreshes its counts on its own
+    schedule and the house's reads between refreshes repeat one page.
+  * Each trophy's recent trajectory is a weighted least-squares line of
+    logit(rate) against ln(1 + hours since release), fitted over the trailing
+    30 hours of states. Working on the logit scale matches the scoring and
+    keeps every forecast inside (0, 100).
+  * A single trophy's slope is noisy, so it is shrunk toward the pooled slope
+    of the trophies sitting at the same rate level (six anchor-logit bins,
+    shrinkage constant 6): rare trophies borrow the typical rare-trophy
+    climb, common ones the typical common-trophy climb.
+  * The median is the shrunk line read at the target, damped as it nears the
+    100% ceiling, and floored by earner conservation: the players who already
+    hold a trophy cannot un-hold it, so the target rate is at least the last
+    rate scaled by the (shrunk, capped) growth of the tracked player base.
+  * The spread is 0.7 times the quadrature sum of a discounted random walk,
+    the pooled fit residual, the within-bin slope dispersion projected over
+    the extrapolation distance, and a counting-noise term 1/sqrt(earners).
+  * Two guards: a trophy with too little usable history falls back to
+    persistence with a wide spread; and a page that has been frozen for at
+    least 1.5 hours inside the first 36 hours after release is treated as
+    stale -- Exophase is about to refresh it, historically with a flood of
+    new players that dilutes every rate -- so the median is shifted down by
+    0.8 logit and the spread is widened asymmetrically upward.
+  * Any failure anywhere falls back to a plain persistence forecast, so the
+    output is always a valid forecast file.
 
-Run locally the way the kit describes:
-    mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
-The grader runs it as `python3 -P -s /bot/main.py`; the sys.path line below puts this
-file's own directory back on the path, as the kit's starter notes explain.
+Run locally with MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR set; the grader's
+/input and /output are the defaults.
 """
 
 import json
@@ -48,452 +49,376 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so a module shipped beside
-# this file would import (this entry is a single file, but the habit is the kit's own).
+# The grader runs python3 -P, which leaves this file's directory off
+# sys.path; put it back first so sibling modules would import.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# The quantile levels the contest scores, in the order each output row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
-# The house random walk's spread, in logit units per square-root day: the yardstick every
-# spread below is built around.
-RW_SIGMA = 0.5
-# How much of the random walk the fitted trend is trusted to explain away. Below 1: a
-# fitted curve that is partly right should still carry most of the walk's uncertainty.
-RW_DISCOUNT = 0.85
-# A final calibration on the whole spread: the components above are each honest, but
-# they are not independent (a trophy whose slope is off also fits worse), so their
-# quadrature sum overstates the whole and is scaled back. The scale (and the fit window
-# below) were set on simulated week-1 worlds -- logistic earn curves in log time, a
-# decelerating tracked count, Exophase-style stale refreshes, 2-decimal rounding, in
-# fast, slow, dilution-heavy, weekend-shifted and page-noisy variants -- where this
-# configuration's loss ran near 0.16 against the curve baseline's 0.25 and the
-# persistence baseline's 0.41; see backtest.py.
-SIGMA_SCALE = 0.7
-# The shrinkage strength of the analog step, in effective observations: a trophy's own
-# slope counts for its number of distinct page states (capped), the pooled slope of its
-# level bin for this many.
-SHRINK_K = 6.0
-# The fit's window, in hours before the checkpoint (None: every page the case holds).
-# Launch night's frozen page and first-refresh cliff are a different regime from the one
-# the forecast extends, so the fit is kept to the recent pages: the last thirty hours,
-# the same span the house curve baseline reads, but pooled.
-FIT_WINDOW_H = 30.0
-# Recency weighting inside the fit: 0 weights every page by its duration alone, 1 tilts
-# the weights from half at the window's start to one and a half at its end.
-RECENCY = 0.0
-# Slopes (logit per unit of ln(1 + hours)) are never trusted outside this band.
-SLOPE_MIN, SLOPE_MAX = -1.0, 4.0
-# A page frozen this long at the checkpoint may be hiding a refresh.
-STALE_HOURS = 1.5
-# The launch-window dilution prior applies only while the game is this young: a frozen
-# page then means the tracked count is about to jump under a fixed set of earners.
-LAUNCH_WINDOW_H = 36.0
-STALE_DILUTION = 0.8
-STALE_SIGMA_DOWN = 1.3
-STALE_SIGMA_UP = 0.9
-# With less than this in the history there is nothing to fit: persistence, widely spread.
-MIN_STATES = 3
-MIN_SPAN_H = 3.0
-THIN_SIGMA = 1.1
-# A page frozen for hours at any age hides whatever happened since it froze; outside the
-# launch window there is no dilution prior to shift the median with, but the spread
-# still widens to at least this.
-STALE_SIGMA_LATE = 1.25
+Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
+
+RATE_LO = 0.01
+RATE_HI = 99.99
+
+WINDOW_H = 30.0        # trailing fit window, hours of page states
+HALF_LIFE_H = 11.0
+SHRINK_K = 6.0         # slope shrinkage constant toward the bin pool
+BIN_EDGES = [-3.9, -2.2, -0.85, 0.4, 1.6]   # anchor-logit edges -> 6 bins
+STALE_MIN_H = 1.5      # a page frozen at least this long is stale ...
+STALE_MAX_AGE_H = 36.0  # ... while the game is younger than this
+STALE_SHIFT = 0.8      # logit shift applied to a stale page's median
+GROWTH_SHRINK = 0.6    # shrink applied to forecast player-base growth
+GROWTH_CAP = 4.0       # the player base is never forecast past 4x
+SPREAD_SCALE = 0.7     # overall spread calibration
+RW_DISCOUNT = 0.85     # discount on the random-walk spread component
+RW_SIGMA = 0.5         # random-walk sigma per sqrt(day), logit units
+
+
+# --------------------------------------------------------------------------
+# small numeric helpers
 
 
 def clamp_rate(x):
-    """A rate in percent clamped to the scorer's own band, 0.01..99.99."""
-    return min(99.99, max(0.01, x))
+    return min(RATE_HI, max(RATE_LO, x))
 
 
 def logit(pct):
-    p = clamp_rate(pct)
-    return math.log(p / (100.0 - p))
+    p = clamp_rate(pct) / 100.0
+    return math.log(p / (1.0 - p))
 
 
-def sigmoid(x):
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-x))
-    e = math.exp(x)
-    return e / (1.0 + e)
+def inv_logit(y):
+    if y >= 0:
+        return 100.0 / (1.0 + math.exp(-y))
+    e = math.exp(y)
+    return 100.0 * e / (1.0 + e)
 
 
 def round4(x):
-    """x rounded to 4 decimals, half up; whole numbers come back as int for compact JSON."""
-    scaled = x * 10000
+    """Round to 4 decimals, half up; whole numbers come back as int so the
+    JSON text matches what a JavaScript writer would emit."""
+    scaled = x * 10000.0
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 10000
+    value = whole / 10000.0
     return int(value) if float(value).is_integer() else value
 
 
 def parse_time(text):
-    """An ISO 8601 UTC timestamp from a case file, as an aware datetime."""
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    """Parse an ISO-8601 timestamp into epoch seconds (float)."""
+    s = text.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
-def weighted_median(pairs):
-    """The weighted median of (value, weight) pairs."""
-    ordered = sorted(pairs)
-    total = sum(w for _, w in ordered)
-    if total <= 0:
-        return ordered[len(ordered) // 2][0]
-    acc = 0.0
-    for value, weight in ordered:
-        acc += weight
-        if acc >= total / 2:
-            return value
-    return ordered[-1][0]
+def release_epoch(case):
+    """Release is the case's release_date at 00:00 UTC."""
+    date = (case.get("game") or {}).get("release_date") or "2026-11-19"
+    dt = datetime.fromisoformat(date).replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
-def weighted_quantile(pairs, tau):
-    """The tau quantile of (value, weight) pairs, linear in the cumulative weight."""
-    ordered = sorted(pairs)
-    total = sum(w for _, w in ordered)
-    if total <= 0:
-        return ordered[len(ordered) // 2][0]
-    target = tau * total
-    acc = 0.0
-    for i, (value, weight) in enumerate(ordered):
-        acc += weight
-        if acc >= target:
-            if i == 0:
-                return value
-            prev = ordered[i - 1][0]
-            frac = (target - (acc - weight)) / weight if weight > 0 else 0.0
-            return prev + (value - prev) * frac
-    return ordered[-1][0]
+def hours_since(epoch, release):
+    return max(0.0, (epoch - release) / 3600.0)
 
 
-class State:
-    """One distinct page: a stretch of reads that all showed the same thing.
-
-    The page only changes when Exophase refreshes it, so the reads between two changes
-    are one observation, not many; a state is kept with the first read that showed it,
-    the read that ended it, and how long it lasted.
-    """
-
-    __slots__ = ("at", "until", "players", "rates")
-
-    def __init__(self, at, players, rates):
-        self.at = at          # hours since release of the first read showing this page
-        self.until = at       # hours since release of the last read showing it
-        self.players = players
-        self.rates = rates
+def u_of(hours):
+    """The curve coordinate: ln(1 + hours since release)."""
+    return math.log1p(max(0.0, hours))
 
 
-def case_states(case, epoch):
-    """The case's history compressed to its distinct pages, oldest first."""
-    states = []
-    for read in case.get("history") or []:
-        try:
-            at = (parse_time(read["at"]) - epoch).total_seconds() / 3600.0
-            players = read.get("players_tracked")
-            rates = read.get("rates") or []
-        except (KeyError, TypeError, ValueError):
-            continue
-        if states and states[-1].players == players and states[-1].rates == list(rates):
-            states[-1].until = at
-        else:
-            states.append(State(at, players, list(rates)))
-    return states
-
-
-def log_time(hours):
-    """u = ln(1 + hours since release), the clock every curve is fitted against."""
-    return math.log(1.0 + max(hours, -0.9))
-
-
-class TrophyFit:
-    """One trophy's fitted curve and everything the forecast needs from it."""
-
-    __slots__ = ("index", "last_rate", "anchor", "anchor_u", "slope", "weight",
-                 "resid_sd", "earners", "bin")
-
-    def __init__(self, index):
-        self.index = index
-        self.last_rate = None
-        self.anchor = 0.0
-        self.anchor_u = 0.0
-        self.slope = None
-        self.weight = 0.0
-        self.resid_sd = None
-        self.earners = 0.0
-        self.bin = 0
-
-
-# Anchor-logit bin edges: trophies are pooled with the ones at their own level, because a
-# trophy's growth in logit terms is set mostly by where it sits -- the rare ones have the
-# whole curve ahead of them, the common ones are already bending toward their ceiling.
-BIN_EDGES = [logit(0.3), logit(1.0), logit(3.0), logit(10.0), logit(30.0)]
-
-
-def bin_of(anchor_logit):
+def bin_index(anchor_logit):
     b = 0
-    while b < len(BIN_EDGES) and anchor_logit > BIN_EDGES[b]:
-        b += 1
+    for edge in BIN_EDGES:
+        if anchor_logit >= edge:
+            b += 1
     return b
 
 
-def fit_trophy(index, states, checkpoint_h):
-    """Fit one trophy's logit curve against log time over the case's distinct pages.
+# --------------------------------------------------------------------------
+# page states
 
-    The anchor is the duration-weighted level of the last few hours of pages (the level
-    the forecast grows from); the slope is a weighted least-squares line through every
-    page, weighted by the square root of how long each page lasted, so a launch-night
-    plateau counts once and the recent pages count most.
+
+def page_states(case):
+    """Compress the read history into distinct page states.
+
+    A state is a maximal run of consecutive reads with identical
+    players_tracked and identical rates. Each state records the epoch of its
+    first and last read, the players tracked and the rates tuple.
     """
-    fit = TrophyFit(index)
-    points = []  # (u, logit, weight, hours, rate, players)
-    for j, state in enumerate(states):
-        rate = state.rates[index] if index < len(state.rates) else None
-        if rate is None:
-            continue
-        end = states[j + 1].at if j + 1 < len(states) else checkpoint_h
-        duration = max(end - state.at, 0.05)
-        points.append((log_time(state.at), logit(rate), math.sqrt(min(duration, 6.0)),
-                       state.at, float(rate), state.players))
-        fit.last_rate = float(rate)
-        if state.players:
-            fit.earners = float(rate) / 100.0 * state.players
-    if FIT_WINDOW_H is not None and len(points) > 3:
-        recent = [p for p in points if p[3] >= checkpoint_h - FIT_WINDOW_H]
-        if len(recent) >= 3:
-            points = recent
-    if RECENCY and len(points) > 1:
-        h0 = min(p[3] for p in points)
-        h1 = max(p[3] for p in points)
-        if h1 > h0:
-            points = [(u, l, w * (1.0 + RECENCY * ((h - h0) / (h1 - h0) - 0.5)), h, r, n)
-                      for (u, l, w, h, r, n) in points]
-    if not points:
-        return fit
-    # The anchor: the trailing pages' levels, weighted by how long each lasted inside
-    # the last eight hours (the final page counts up to the checkpoint).
-    window_start = checkpoint_h - 8.0
-    num = 0.0
-    den = 0.0
-    for j, state in enumerate(states):
-        rate = state.rates[index] if index < len(state.rates) else None
-        if rate is None:
-            continue
-        end = states[j + 1].at if j + 1 < len(states) else checkpoint_h
-        overlap = max(0.0, min(end, checkpoint_h) - max(state.at, window_start))
-        if overlap > 0:
-            num += overlap * logit(rate)
-            den += overlap
-    fit.anchor = num / den if den > 0 else points[-1][1]
-    fit.anchor_u = log_time(checkpoint_h)
-    if len(points) >= 3:
-        sw = sum(p[2] for p in points)
-        mu_u = sum(p[2] * p[0] for p in points) / sw
-        mu_l = sum(p[2] * p[1] for p in points) / sw
-        sxx = sum(p[2] * (p[0] - mu_u) ** 2 for p in points)
-        if sxx > 1e-9:
-            sxy = sum(p[2] * (p[0] - mu_u) * (p[1] - mu_l) for p in points)
-            slope = sxy / sxx
-            resid = [p[1] - (mu_l + slope * (p[0] - mu_u)) for p in points]
-            fit.resid_sd = math.sqrt(sum(r * r for r in resid) / len(resid))
-            fit.slope = min(SLOPE_MAX, max(SLOPE_MIN, slope))
-            span_u = max(p[0] for p in points) - min(p[0] for p in points)
-            fit.weight = min(len(points), 12) * min(span_u, 1.5)
-    fit.bin = bin_of(fit.anchor)
-    return fit
-
-
-def fit_players(states):
-    """The tracked count's own slope against log time, from the distinct pages."""
-    points = [(log_time(s.at), math.log(s.players)) for s in states if s.players]
-    if len(points) < 3:
-        return 0.0
-    sw = float(len(points))
-    mu_u = sum(p[0] for p in points) / sw
-    mu_l = sum(p[1] for p in points) / sw
-    sxx = sum((p[0] - mu_u) ** 2 for p in points)
-    if sxx <= 1e-9:
-        return 0.0
-    return sum((p[0] - mu_u) * (p[1] - mu_l) for p in points) / sxx
-
-
-def pooled_slopes(fits):
-    """Each level bin's pooled slope and slope dispersion, and the global pair.
-
-    A bin with fewer than three fitted trophies borrows the global figures; a bin's
-    dispersion is its slopes' interquartile range, robust to the one wild fit.
-    """
-    def pool(group):
-        if not group:
-            return None, 0.0
-        pairs = [(f.slope, max(f.weight, 0.1)) for f in group]
-        med = weighted_median(pairs)
-        q25 = weighted_quantile(pairs, 0.25)
-        q75 = weighted_quantile(pairs, 0.75)
-        return med, (q75 - q25) / 1.349
-
-    fitted = [f for f in fits if f.slope is not None]
-    global_med, global_sd = pool(fitted)
-    if global_med is None:
-        global_med, global_sd = 0.0, 0.5
-    bins = {}
-    for b in range(len(BIN_EDGES) + 1):
-        group = [f for f in fitted if f.bin == b]
-        if len(group) >= 3:
-            bins[b] = pool(group)
+    states = []
+    for read in case["history"]:
+        rates = tuple(read["rates"])
+        players = read["players_tracked"]
+        at = parse_time(read["at"])
+        if states and states[-1]["players"] == players and states[-1]["rates"] == rates:
+            states[-1]["last"] = at
+            states[-1]["reads"] += 1
         else:
-            bins[b] = (global_med, global_sd)
-    return bins, (global_med, global_sd)
+            states.append({
+                "first": at,
+                "last": at,
+                "reads": 1,
+                "players": players,
+                "rates": rates,
+            })
+    return states
 
 
-def saturation_damp(anchor_logit):
-    """How much of a positive logit step survives near the ceiling.
+# --------------------------------------------------------------------------
+# weighted line fit
 
-    A trophy already held by a third of the tracked players cannot keep a rare trophy's
-    pace: its remaining earners are the slow tail. The damp runs from ~1 for rare
-    trophies to ~0.6 for common ones.
-    """
-    return 0.55 + 0.45 / (1.0 + math.exp((anchor_logit - 0.5) / 0.75))
+
+def wls_line(xs, ys, ws):
+    """Weighted least squares y ~ a + b x. Returns (a, b, rms_residual)."""
+    sw = sum(ws)
+    if sw <= 0:
+        return None
+    mx = sum(w * x for x, w in zip(xs, ws)) / sw
+    my = sum(w * y for y, w in zip(ys, ws)) / sw
+    sxx = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws))
+    if sxx <= 1e-12:
+        return (my, 0.0, 0.0)
+    sxy = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws))
+    b = sxy / sxx
+    a = my - b * mx
+    rms = math.sqrt(sum(w * (y - (a + b * x)) ** 2 for x, y, w in zip(xs, ys, ws)) / sw)
+    return (a, b, rms)
+
+
+# --------------------------------------------------------------------------
+# per-trophy raw fits
+
+
+def trophy_fit(states, idx, release, checkpoint):
+    """Fit one trophy's recent trajectory. Returns a dict, or None when the
+    trophy has no usable rate anywhere in the history."""
+    pts = []  # (hours since release, rate) over distinct states
+    for st in states:
+        rate = st["rates"][idx]
+        if rate is None:
+            continue
+        pts.append((hours_since(st["last"], release), rate))
+    if not pts:
+        return None
+    last_h, last_rate = pts[-1]
+    anchor = logit(last_rate)
+
+    cutoff = hours_since(checkpoint, release) - WINDOW_H
+    win = [(h, r) for (h, r) in pts if h >= cutoff]
+    fit = None
+    if len(win) >= 3 and win[-1][0] - win[0][0] > 0.25:
+        xs = [u_of(h) for h, _ in win]
+        ys = [logit(r) for _, r in win]
+        ws = [0.5 ** ((win[-1][0] - h) / HALF_LIFE_H) for h, _ in win]
+        got = wls_line(xs, ys, ws)
+        if got is not None:
+            fit = {"slope": got[1], "rms": got[2], "n": len(win)}
+    return {
+        "last_h": last_h,
+        "last_rate": last_rate,
+        "anchor": anchor,
+        "bin": bin_index(anchor),
+        "fit": fit,
+    }
+
+
+# --------------------------------------------------------------------------
+# player-base growth
+
+
+def forecast_players(states, checkpoint, target):
+    """Forecast the tracked player count at the target: log-linear growth
+    over the distinct states, shrunk and capped. Returns (n_last, n_target)."""
+    n_last = states[-1]["players"]
+    series = [(st["last"], st["players"]) for st in states if st["players"]]
+    ratio = 1.0
+    if len(series) >= 2 and series[0][1] > 0 and series[-1][0] > series[0][0]:
+        span_h = (series[-1][0] - series[0][0]) / 3600.0
+        growth = math.log(series[-1][1] / series[0][1]) / span_h  # per hour
+        ahead_h = max(0.0, (target - checkpoint) / 3600.0)
+        ratio = math.exp(growth * ahead_h)
+    ratio = min(GROWTH_CAP, max(1.0, ratio))
+    ratio = 1.0 + GROWTH_SHRINK * (ratio - 1.0)
+    return n_last, n_last * ratio
+
+
+# --------------------------------------------------------------------------
+# the forecast
+
+
+def persistence_rows(case, extra_wide=0.0):
+    """Last rate carried forward, with a random-walk spread."""
+    last = case["history"][-1]
+    days = max(0.0, case["horizon_minutes"] / 1440.0)
+    sigma = RW_SIGMA * math.sqrt(days) + extra_wide
+    rows = []
+    for i, trophy in enumerate(case["trophies"]):
+        rate = last["rates"][i]
+        if rate is None:
+            rate = 0.0
+        centre = logit(rate)
+        qs = []
+        prev = RATE_LO
+        for z in Z:
+            q = max(clamp_rate(inv_logit(centre + z * sigma)), prev)
+            prev = q
+            qs.append(round4(q))
+        rows.append({"id": trophy["id"], "q": qs})
+    return {"trophies": rows}
+
+
+def wide_row(trophy_id, centre_logit, sigma):
+    qs = []
+    prev = RATE_LO
+    for z in Z:
+        q = max(clamp_rate(inv_logit(centre_logit + z * sigma)), prev)
+        prev = q
+        qs.append(round4(q))
+    return {"id": trophy_id, "q": qs}
 
 
 def forecast_case(case):
-    """One case's forecast object: {"trophies": [{"id": n, "q": [...]}, ...]}."""
-    trophies = case.get("trophies") or []
+    if case.get("levels") != LEVELS:
+        raise ValueError("unexpected levels")
+    history = case.get("history") or []
+    if not history:
+        raise ValueError("empty history")
+
+    release = release_epoch(case)
     checkpoint = parse_time(case["at"])
     target = parse_time(case["target"])
-    try:
-        epoch = datetime.fromisoformat(str(case["game"]["release_date"])).replace(
-            tzinfo=timezone.utc)
-    except (KeyError, TypeError, ValueError):
-        epoch = checkpoint
-    checkpoint_h = (checkpoint - epoch).total_seconds() / 3600.0
-    target_h = (target - epoch).total_seconds() / 3600.0
-    horizon_days = max(case.get("horizon_minutes", 0) / 1440.0, 0.0)
-    states = case_states(case, epoch)
-    last = (case.get("history") or [{}])[-1]
-    last_rates = last.get("rates") or []
+    states = page_states(case)
+    if not states:
+        raise ValueError("no page states")
 
-    def last_rate(i):
-        rate = last_rates[i] if i < len(last_rates) else None
-        if rate is None:
-            for state in reversed(states):
-                if i < len(state.rates) and state.rates[i] is not None:
-                    rate = state.rates[i]
-                    break
-        return float(rate) if rate is not None else 0.01
+    trophies = case["trophies"]
+    fits = [trophy_fit(states, i, release, checkpoint) for i in range(len(trophies))]
 
-    rw = RW_SIGMA * math.sqrt(horizon_days)
-    span_h = (states[-1].until - states[0].at) if states else 0.0
-    stale_h = (checkpoint_h - states[-1].at) if states else 0.0
+    # pooled statistics per anchor bin
+    bin_slopes = {}
+    all_rms = []
+    for f in fits:
+        if f and f["fit"]:
+            bin_slopes.setdefault(f["bin"], []).append((f["fit"]["slope"], f["fit"]["n"]))
+            all_rms.append(f["fit"]["rms"])
+    every_slope = [s for vals in bin_slopes.values() for s, _ in vals]
+    global_slope = (sum(every_slope) / len(every_slope)) if every_slope else 0.0
+    pooled_slope = {}
+    pooled_disp = {}
+    for b, vals in bin_slopes.items():
+        tot_n = sum(n for _, n in vals)
+        pooled_slope[b] = sum(s * n for s, n in vals) / tot_n if tot_n else global_slope
+        if len(vals) >= 2:
+            mean = sum(s for s, _ in vals) / len(vals)
+            pooled_disp[b] = math.sqrt(sum((s - mean) ** 2 for s, _ in vals) / len(vals))
+        else:
+            pooled_disp[b] = 0.35
+    all_rms.sort()
+    pooled_rms = all_rms[len(all_rms) // 2] if all_rms else 0.15
 
-    # Too thin to fit: persistence, with a spread honest about a page that may be stale.
-    if len(states) < MIN_STATES or span_h < MIN_SPAN_H:
-        sigma = max(rw, THIN_SIGMA)
-        launch_stale = stale_h >= STALE_HOURS and checkpoint_h <= LAUNCH_WINDOW_H
-        if stale_h >= STALE_HOURS and not launch_stale:
-            sigma = max(sigma, STALE_SIGMA_LATE)
-        rows = []
-        for i, trophy in enumerate(trophies):
-            med = logit(last_rate(i))
-            if launch_stale:
-                med -= STALE_DILUTION
-                qs = [100.0 * sigmoid(med + z * (STALE_SIGMA_DOWN if z < 0 else STALE_SIGMA_UP))
-                      for z in Z]
-            else:
-                qs = [100.0 * sigmoid(med + z * sigma) for z in Z]
-            rows.append({"id": trophy["id"], "q": finish_row(qs)})
-        return {"trophies": rows}
+    n_last, n_target = forecast_players(states, checkpoint, target)
 
-    fits = [fit_trophy(i, states, checkpoint_h) for i in range(len(trophies))]
-    bins, _global = pooled_slopes(fits)
-    resids = [f.resid_sd for f in fits if f.resid_sd is not None]
-    fit_sd = sorted(resids)[len(resids) // 2] if resids else 0.25
-    # The tracked count at the target, grown at 60% of its fitted log-time slope and
-    # capped: the floor it sets on every rate (earners never un-earn).
-    players_last = states[-1].players or 0
-    du = log_time(target_h) - log_time(checkpoint_h)
-    growth = math.exp(0.6 * fit_players(states) * du) if players_last else 1.0
-    growth = min(max(growth, 1.0), 4.0)
-    stale = stale_h >= STALE_HOURS and checkpoint_h <= LAUNCH_WINDOW_H
+    # staleness of the page the checkpoint sees
+    last_state = states[-1]
+    frozen_h = (checkpoint - last_state["first"]) / 3600.0
+    age_h = hours_since(checkpoint, release)
+    stale = frozen_h >= STALE_MIN_H and age_h <= STALE_MAX_AGE_H
+
+    days_ahead = max(0.0, (target - checkpoint) / 86400.0)
+    x_target = u_of(hours_since(target, release))
+    rw = RW_DISCOUNT * RW_SIGMA * math.sqrt(days_ahead)
 
     rows = []
     for i, trophy in enumerate(trophies):
         f = fits[i]
-        rate = f.last_rate if f.last_rate is not None else last_rate(i)
-        bin_med, bin_sd = bins[f.bin]
-        if f.slope is None:
-            slope = bin_med
+        if f is None:
+            # never seen anywhere: near-zero centre, very wide spread
+            sigma = 0.6 + 0.5 * math.sqrt(days_ahead)
+            rows.append(wide_row(trophy["id"], logit(0.0), sigma))
+            continue
+
+        centre = f["anchor"]
+        x_last = u_of(f["last_h"])
+        du = max(0.0, x_target - x_last)
+
+        if f["fit"] is None:
+            # thin history: persistence median, wide spread
+            sigma = 0.35 + RW_SIGMA * math.sqrt(days_ahead)
+            disp_term = 0.35 * du
         else:
-            slope = (f.weight * f.slope + SHRINK_K * bin_med) / (f.weight + SHRINK_K)
-        step = slope * du
-        if step > 0:
-            step *= saturation_damp(f.anchor)
-        med = f.anchor + step
-        # The counts floor: the earners already counted, spread over the grown tracked
-        # count, is the lowest the median may sit.
-        if players_last:
-            floor_rate = rate * (1.0 / growth)
-            med = max(med, logit(floor_rate))
+            pool = pooled_slope.get(f["bin"], global_slope)
+            n = min(f["fit"]["n"], 24)
+            slope = (n * f["fit"]["slope"] + SHRINK_K * pool) / (n + SHRINK_K)
+            # keep the extrapolation sane: a fitted slope outside this band
+            # is a two-point accident, not a trajectory
+            slope = min(6.0, max(-3.0, slope))
+            delta = slope * du
+            if delta > 0:
+                # saturation damping near the ceiling
+                damp = min(1.0, (100.0 - clamp_rate(f["last_rate"])) / 25.0 + 0.15)
+                delta *= damp
+            centre = centre + delta
+            disp_term = pooled_disp.get(f["bin"], 0.35) * du
+            sigma = None  # from components below
+
+        # earner-conservation floor on the median: earners cannot un-earn
+        if n_target > 0:
+            floor_rate = f["last_rate"] * n_last / n_target
+            centre = max(centre, logit(floor_rate))
+
+        earners = max(1.0, clamp_rate(f["last_rate"]) / 100.0 * max(n_last, 1))
+        noise = 1.0 / math.sqrt(earners)
+        if sigma is None:
+            sigma = SPREAD_SCALE * math.sqrt(
+                rw * rw + pooled_rms * pooled_rms + disp_term * disp_term + noise * noise
+            )
+        sigma = min(2.5, max(0.05, sigma))
+
+        sigma_lo = sigma
+        sigma_hi = sigma
         if stale:
-            med -= STALE_DILUTION * 0.5
-        meas = min(1.2, 1.0 / math.sqrt(max(f.earners, 1.0)))
-        slope_sd = bin_sd * du
-        sigma = SIGMA_SCALE * math.sqrt((RW_DISCOUNT * rw) ** 2 + fit_sd ** 2
-                                        + slope_sd ** 2 + meas ** 2)
-        if stale:
-            qs = [100.0 * sigmoid(med + z * (max(sigma, STALE_SIGMA_DOWN) if z < 0
-                                             else max(sigma, STALE_SIGMA_UP)))
-                  for z in Z]
-        else:
-            qs = [100.0 * sigmoid(med + z * sigma) for z in Z]
-        rows.append({"id": trophy["id"], "q": finish_row(qs)})
+            centre -= STALE_SHIFT
+            sigma_lo = sigma * 0.75
+            sigma_hi = sigma * 1.55
+
+        qs = []
+        prev = RATE_LO
+        for z in Z:
+            s = sigma_hi if z > 0 else sigma_lo
+            q = max(clamp_rate(inv_logit(centre + z * s)), prev)
+            prev = q
+            qs.append(round4(q))
+        rows.append({"id": trophy["id"], "q": qs})
     return {"trophies": rows}
 
 
-def finish_row(qs):
-    """Quantiles in percent: clamped to the scorer's band, non-decreasing, rounded."""
-    out = []
-    prev = 0.01
-    for q in qs:
-        value = round4(min(99.99, max(0.01, q)))
-        value = max(value, prev)
-        out.append(value)
-        prev = value
-    return out
+def forecast_case_safe(case):
+    """The model, with a persistence safety net: whatever goes wrong, the
+    grader still gets a valid forecast file for the case."""
+    try:
+        return forecast_case(case)
+    except Exception:
+        return persistence_rows(case)
+
+
+# --------------------------------------------------------------------------
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        try:
-            forecast = forecast_case(case)
-        except Exception:
-            # Never fail a case: persistence at the last read beats an invalid one.
-            forecast = fallback_case(case)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
-        )
-
-
-def fallback_case(case):
-    """The house persistence row for every trophy, from the case's last read."""
-    last = (case.get("history") or [{}])[-1]
-    rates = last.get("rates") or []
-    horizon_days = max(case.get("horizon_minutes", 0) / 1440.0, 0.0)
-    spread = RW_SIGMA * math.sqrt(horizon_days)
-    rows = []
-    for i, trophy in enumerate(case.get("trophies") or []):
-        rate = rates[i] if i < len(rates) and rates[i] is not None else 0.01
-        lg = logit(rate)
-        rows.append({"id": trophy["id"],
-                     "q": finish_row([100.0 * sigmoid(lg + z * spread) for z in Z])})
-    return {"trophies": rows}
+        out = forecast_case_safe(case)
+        text = json.dumps(out, separators=(",", ":")) + "\n"
+        (OUTPUT_DIR / (path.stem + ".out")).write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":
