@@ -20,8 +20,16 @@ Three forecasters are scored on identical cases:
                     the last 24 h of reads, read at the target, spread the
                     random walk and the fit residual combined
 
-Six regimes (base, fast, slow, dilution, weekend, noisy) x four seeds each.
-The numbers are simulator numbers: they compare forecasters on equal
+Six regimes (base, fast, slow, dilution, weekend, noisy) x four seeds each,
+plus a seventh, freeze: a base world whose page stops refreshing 23.5 hours
+before the checkpoint, so the anchor page is stale and a whole day of
+evolution is unobserved -- the shape of the launch-night practice failure,
+where a frozen page's first refresh dropped every rate outside the band.
+Unlike the six classic regimes (whose reads jitter independently), the
+freeze world's page repeats exactly between refreshes, as the real page
+does. The table reports each forecaster's loss and its 90% coverage (the
+share of trophies whose true rate lands inside the 5-95% band; nominal
+0.90). The numbers are simulator numbers: they compare forecasters on equal
 footing, they are not a promise about the real launch week.
 
     python3 backtest.py
@@ -60,6 +68,12 @@ def pinball_mean(rows, truth):
             total += 2.0 * max(tau * d, (tau - 1.0) * d)
             count += 1
     return total / count
+
+
+def coverage90(rows, truth):
+    """Share of trophies whose true rate lands inside the 5-95% band."""
+    inside = sum(1 for row, y in zip(rows, truth) if row["q"][0] <= y <= row["q"][4])
+    return inside / len(truth)
 
 
 # --------------------------------------------------------------------------
@@ -201,26 +215,126 @@ def make_world(regime, seed):
     return case, truth
 
 
+FREEZE_AT_H = 36.0  # the freeze world's page stops refreshing here
+
+
+def make_freeze_world(seed):
+    """A base world whose page freezes at FREEZE_AT_H: every read after that
+    repeats one page exactly (players and rates), while the truth keeps
+    evolving underneath. The checkpoint therefore anchors on a page that is
+    CHECKPOINT_H - FREEZE_AT_H hours stale."""
+    rng = random.Random(zlib.crc32(f"freeze:{seed}".encode()))
+    p_mid, p_wid, e_shift, noise, refresh_h = REGIMES["base"]
+    n_inf = rng.uniform(60000, 300000)
+
+    players = lambda t: n_inf * sigmoid((math.log1p(t) - p_mid) / p_wid)
+
+    trophies = []
+    for _ in range(N_TROPHIES):
+        trophies.append({
+            "share": sigmoid(rng.uniform(-4.5, 1.5)),
+            "mid": rng.uniform(1.2, 4.6) + e_shift,
+            "wid": rng.uniform(0.35, 0.8),
+        })
+
+    def true_rates(t):
+        n = players(t)
+        return [100.0 * tr["share"] * n_inf
+                * sigmoid((math.log1p(t) - tr["mid"]) / tr["wid"]) / n
+                for tr in trophies]
+
+    history = []
+    shown_cache = {}
+    step = 0.5
+    t = 0.0
+    while t <= CHECKPOINT_H + 1e-9:
+        shown_t = math.floor(min(t, FREEZE_AT_H) / refresh_h) * refresh_h
+        if shown_t not in shown_cache:
+            # one noisy page per refresh, then repeated exactly -- as the
+            # real page repeats between refreshes
+            rates = []
+            for r in true_rates(shown_t):
+                noisy = r * math.exp(rng.gauss(0.0, noise)) if r > 0 else r
+                rates.append(round(min(100.0, max(0.0, noisy)), 2))
+            shown_cache[shown_t] = (int(round(players(shown_t))), rates)
+        players_shown, rates = shown_cache[shown_t]
+        at = RELEASE + timedelta(hours=t)
+        history.append({
+            "slot": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "players_tracked": players_shown,
+            "trophies_earned": 0,
+            "rates": list(rates),
+        })
+        t += step
+
+    case = {
+        "schema": "makefun/gta6-trophies-case/v1",
+        "id": f"sim-freeze-{seed}",
+        "at": (RELEASE + timedelta(hours=CHECKPOINT_H)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "horizon_minutes": int((TARGET_H - CHECKPOINT_H) * 60),
+        "target": (RELEASE + timedelta(hours=TARGET_H)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "levels": LEVELS,
+        "game": {"name": "Grand Theft Auto VI", "platform": "PS5",
+                 "release_date": "2026-11-19"},
+        "trophies": [{"id": i + 1, "name": f"Sim Trophy {i + 1}",
+                      "description": "", "tier": "bronze", "points": 15,
+                      "secret": False} for i in range(N_TROPHIES)],
+        "history": history,
+        "notes": "synthetic freeze",
+    }
+    truth = [round(min(100.0, max(0.0, r)), 2) for r in true_rates(TARGET_H)]
+    return case, truth
+
+
 # --------------------------------------------------------------------------
 
 
+def score_all(case, truth):
+    """(loss, coverage90) for the model and both house baselines."""
+    model = forecaster.forecast_case_safe(case)["trophies"]
+    persist = persistence_forecast(case)
+    curve = curve_forecast(case)
+    return {
+        "model": (pinball_mean(model, truth), coverage90(model, truth)),
+        "persist": (pinball_mean(persist, truth), coverage90(persist, truth)),
+        "curve": (pinball_mean(curve, truth), coverage90(curve, truth)),
+    }
+
+
 def run():
-    print(f"{'regime':<10} {'model':>8} {'persist':>8} {'curve':>8}")
+    print(f"{'regime':<10} {'model':>8} {'cov90':>6} {'persist':>8} {'cov90':>6} "
+          f"{'curve':>8} {'cov90':>6}")
     totals = {"model": [], "persist": [], "curve": []}
-    for regime in REGIMES:
+    covs = {"model": [], "persist": [], "curve": []}
+
+    def one(label, worlds):
         agg = {"model": [], "persist": [], "curve": []}
-        for seed in range(4):
-            case, truth = make_world(regime, seed)
-            agg["model"].append(pinball_mean(forecaster.forecast_case_safe(case)["trophies"], truth))
-            agg["persist"].append(pinball_mean(persistence_forecast(case), truth))
-            agg["curve"].append(pinball_mean(curve_forecast(case), truth))
+        agc = {"model": [], "persist": [], "curve": []}
+        for case, truth in worlds:
+            got = score_all(case, truth)
+            for k in agg:
+                agg[k].append(got[k][0])
+                agc[k].append(got[k][1])
         means = {k: sum(v) / len(v) for k, v in agg.items()}
+        cmeans = {k: sum(v) / len(v) for k, v in agc.items()}
+        print(f"{label:<10} {means['model']:>8.3f} {cmeans['model']:>6.3f} "
+              f"{means['persist']:>8.3f} {cmeans['persist']:>6.3f} "
+              f"{means['curve']:>8.3f} {cmeans['curve']:>6.3f}")
+        return agg, agc
+
+    for regime in REGIMES:
+        agg, agc = one(regime, [make_world(regime, seed) for seed in range(4)])
         for k in totals:
             totals[k].extend(agg[k])
-        print(f"{regime:<10} {means['model']:>8.3f} {means['persist']:>8.3f} {means['curve']:>8.3f}")
+            covs[k].extend(agc[k])
     print(f"{'MEAN':<10} {sum(totals['model'])/len(totals['model']):>8.3f} "
+          f"{sum(covs['model'])/len(covs['model']):>6.3f} "
           f"{sum(totals['persist'])/len(totals['persist']):>8.3f} "
-          f"{sum(totals['curve'])/len(totals['curve']):>8.3f}")
+          f"{sum(covs['persist'])/len(covs['persist']):>6.3f} "
+          f"{sum(totals['curve'])/len(totals['curve']):>8.3f} "
+          f"{sum(covs['curve'])/len(covs['curve']):>6.3f}")
+    one("freeze", [make_freeze_world(seed) for seed in range(4)])
 
 
 if __name__ == "__main__":

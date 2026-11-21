@@ -29,6 +29,14 @@ Method, in outline:
   * The spread is 0.7 times the quadrature sum of a discounted random walk,
     the pooled fit residual, the within-bin slope dispersion projected over
     the extrapolation distance, and a counting-noise term 1/sqrt(earners).
+    Added to that in quadrature, unscaled, is a random walk over the span
+    the anchor page has been frozen: the evolution since its last refresh
+    is unobserved, and it has already happened, so it is not discounted.
+    A trophy whose history holds a single page state has never seen a
+    refresh at all; its spread is floored at 0.85 logit, because a launch's
+    first refresh arrives as a flood of new players that dilutes every
+    rate at once (on launch night the tracked base jumped 6x between one
+    read and the next, and every rate fell by more than the old band).
   * Two guards: a trophy with too little usable history falls back to
     persistence with a wide spread; and a page that has been frozen for at
     least 1.5 hours inside the first 36 hours after release is treated as
@@ -72,6 +80,7 @@ STALE_SHIFT = 0.8      # logit shift applied to a stale page's median
 GROWTH_SHRINK = 0.6    # shrink applied to forecast player-base growth
 GROWTH_CAP = 4.0       # the player base is never forecast past 4x
 SPREAD_SCALE = 0.7     # overall spread calibration
+SINGLE_STATE_SIGMA = 0.85  # spread floor when no page refresh was ever seen
 RW_DISCOUNT = 0.85     # discount on the random-walk spread component
 RW_SIGMA = 0.5         # random-walk sigma per sqrt(day), logit units
 
@@ -335,6 +344,10 @@ def forecast_case(case):
     days_ahead = max(0.0, (target - checkpoint) / 86400.0)
     x_target = u_of(hours_since(target, release))
     rw = RW_DISCOUNT * RW_SIGMA * math.sqrt(days_ahead)
+    # The anchor page may be frozen: the evolution since its last refresh is
+    # unobserved, so the random walk also runs over the frozen span.
+    stale_term = RW_SIGMA * math.sqrt(max(0.0, frozen_h) / 24.0)
+    single_state = len(states) == 1
 
     rows = []
     for i, trophy in enumerate(trophies):
@@ -351,7 +364,15 @@ def forecast_case(case):
 
         if f["fit"] is None:
             # thin history: persistence median, wide spread
-            sigma = 0.35 + RW_SIGMA * math.sqrt(days_ahead)
+            sigma = math.sqrt(
+                (0.35 + RW_SIGMA * math.sqrt(days_ahead)) ** 2 + stale_term ** 2
+            )
+            if single_state:
+                # No refresh has ever been observed, so the first one is
+                # still pending -- and a launch's first refresh arrives as a
+                # flood of new players that dilutes every rate at once (on
+                # launch night the tracked base jumped 6x between reads).
+                sigma = max(sigma, SINGLE_STATE_SIGMA)
             disp_term = 0.35 * du
         else:
             pool = pooled_slope.get(f["bin"], global_slope)
@@ -377,8 +398,13 @@ def forecast_case(case):
         earners = max(1.0, clamp_rate(f["last_rate"]) / 100.0 * max(n_last, 1))
         noise = 1.0 / math.sqrt(earners)
         if sigma is None:
-            sigma = SPREAD_SCALE * math.sqrt(
-                rw * rw + pooled_rms * pooled_rms + disp_term * disp_term + noise * noise
+            # the stale term is added unscaled: the walk over the frozen
+            # span has already happened, it is not a forecast to discount
+            sigma = math.sqrt(
+                (SPREAD_SCALE * math.sqrt(
+                    rw * rw + pooled_rms * pooled_rms + disp_term * disp_term
+                    + noise * noise)) ** 2
+                + stale_term * stale_term
             )
         sigma = min(2.5, max(0.05, sigma))
 

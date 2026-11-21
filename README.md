@@ -39,9 +39,15 @@ every `*.in` case in `$MAKEFUN_INPUT_DIR` and writes `<id>.out` files to
 5. **An honest spread.** The interval is 0.7 × the quadrature sum of a
    discounted random walk (0.85 × 0.5 × √days ahead), the pooled fit
    residual, the within-bin slope dispersion projected over the
-   extrapolation distance, and a counting-noise term 1/√earners.
+   extrapolation distance, and a counting-noise term 1/√earners — plus,
+   added unscaled in quadrature, a random walk over the span the anchor
+   page has been frozen, because the evolution since its last refresh is
+   unobserved and has already happened.
 6. **Guards.** A trophy with too little usable history falls back to
-   persistence with a wide spread. A page frozen for ≥ 1.5 hours within the
+   persistence with a wide spread; if its whole history is a single page
+   state — no refresh ever observed — the spread is floored at 0.85 logit,
+   since the first refresh is still pending and arrives as a player flood.
+   A page frozen for ≥ 1.5 hours within the
    first 36 hours after release is treated as stale — Exophase is about to
    refresh it, and launch-night's first refresh arrived with a flood of new
    players that diluted every rate — so the median shifts down 0.8 logit
@@ -57,7 +63,8 @@ accumulation per trophy over a growing tracked player base, a periodic
 page-refresh cadence, 2-decimal rounding and observation noise — cuts each
 into a case of the final's exact shape (checkpoint at 59.5 h, target at
 168 h), and scores all three forecasters with the contest's exact
-logit-scale pinball loss. Six regimes × four seeds:
+logit-scale pinball loss. Six regimes × four seeds, plus a freeze regime
+whose page stops refreshing 23.5 hours before the checkpoint:
 
 | regime   | model | persistence | curve |
 |----------|------:|------------:|------:|
@@ -68,11 +75,18 @@ logit-scale pinball loss. Six regimes × four seeds:
 | weekend  | 0.382 |       0.521 | 0.582 |
 | noisy    | 0.508 |       0.572 | 0.584 |
 | **mean** | **0.372** |   **0.478** | **0.534** |
+| freeze   | 0.798 |       0.911 | 0.922 |
 
 These are simulator numbers — a like-for-like comparison of forecasters,
 not a promise about the real launch week. The model beats both house
 baselines in every regime, most decisively where a naive forecast hurts
 most: slow climbs, player-base dilution, and the weekend acceleration.
+Its 90% coverage sits at 0.94–1.00 across the six regimes and 0.87 in the
+freeze regime (0.82 before the frozen-span term was added); the live
+practice grade told the same story from the other side — coverage 0.07 on
+launch night, where the old band was only 1.8 logit wide against a ~1.8
+logit dilution drop — and the single-state floor now puts the practice
+band at 3.2 logit wide.
 
 On the kit's practice cases (launch night, frozen page) the program writes
 valid, byte-identical output across runs in well under a second — far inside
